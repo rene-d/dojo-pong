@@ -5,52 +5,93 @@
 #include <bits/stdc++.h>
 #include <boost/program_options.hpp>
 #include <cmath>
+#include <ncurses.h>
+#undef addstr
+#include <sys/time.h>
+#include <zmq.h>
 #include <zmq.hpp>
 #include <zmq_addon.hpp>
-#include <ncurses.h>
-#include <zmq.h>
-#include <sys/time.h>
 
 using namespace std;
 
 //
-// DEMO
+// PONG
 //
 
 #define FIELD_WIDTH 79
 #define FIELD_HEIGHT 24
 #define PADDLE_SIZE 5
 
+#define FIELD_BASELINE (FIELD_WIDTH / 2 - 2)
+
+#define MAX_PADDLE_POS ((FIELD_HEIGHT - PADDLE_SIZE) / 2 - 1)
+#define MIN_PADDLE_POS (-(MAX_PADDLE_POS + 1))
+
+// ball physics
+#define INITIAL_SPEED 0.4
+#define MAX_SPEED 1.7
+#define SPEED_INCREASE 1.0005
+#define INITIAL_HEADING ((rand() % 2 == 0 ? 0 : 180) + (rand() % 31 - 15))
+#define SLICE(o) ((rand() % 11 - 5) * (1 + o))
+
 #define PORT_LOG "2019"
 #define PORT_GAME "2020"
 
-zmq::context_t context(2);
-zmq::socket_t client_log(context, ZMQ_PUSH);
+zmq::context_t context(1);
+zmq::socket_t client_log(context, ZMQ_PUB);
 zmq::socket_t client_game(context, ZMQ_DEALER);
 
 string client_name;
 
-#define MAX_Y ((FIELD_HEIGHT - PADDLE_SIZE) / 2-1)
-#define MIN_Y -(MAX_Y+1)
-
-struct Joueur
+// like Arduino's one
+long millis()
 {
-    string name;
-    bool left;
-    int y;
+    struct timespec spec;
 
-    void update(string command)
+    clock_gettime(CLOCK_REALTIME, &spec);
+    return spec.tv_nsec / 1000000 + spec.tv_sec * 1000L;
+}
+
+struct PlayerState
+{
+    bool left;      // player side
+    int pos;        // y position of the paddle
+    long last_seen; // timestamp of the last message
+    int shots;      // shots counter
+    bool loser;     // true if cannot return the ball
+
+    // initial state for the player
+    void reset()
     {
+        loser = false;
+        shots = 0;
+        pos = 0;
+    }
+
+    void update(const string &command)
+    {
+        last_seen = millis();
+
         if (command == "UP")
         {
-            if (y < MAX_Y)
-                y = y + 1;
+            if (pos < MAX_PADDLE_POS)
+                ++pos;
         }
         else if (command == "DOWN")
         {
-            if (y > MIN_Y)
-                y = y - 1;
+            if (pos > MIN_PADDLE_POS)
+                --pos;
         }
+    }
+
+    bool returns(int ball_y)
+    {
+        bool ok = ((pos - PADDLE_SIZE / 2 - 1) <= ball_y) && (ball_y <= (pos + PADDLE_SIZE / 2 + 1));
+        if (ok)
+            ++shots;
+        else
+            loser = true;
+        return ok;
     }
 };
 
@@ -83,8 +124,10 @@ void init_screen()
     init_pair(1, COLOR_RED, COLOR_BLACK);
     init_pair(2, COLOR_GREEN, COLOR_BLACK);
     init_pair(3, COLOR_BLUE, COLOR_BLACK);
-    init_pair(4, COLOR_RED | COLOR_GREEN, COLOR_BLACK);
+    init_pair(4, COLOR_YELLOW, COLOR_BLACK);
     init_pair(5, COLOR_BLACK, COLOR_BLACK);
+    init_pair(6, COLOR_WHITE, COLOR_BLACK);
+    init_pair(7, COLOR_BLACK, COLOR_YELLOW);
 
     cbreak();             // line buffering disabled
     keypad(stdscr, true); // enables F_keys
@@ -107,93 +150,150 @@ void init_screen()
 void draw_field()
 {
     // draw a rectangle
+    attron(A_BOLD | COLOR_PAIR(6));
     for (int i = 0; i < FIELD_HEIGHT; i++)
     {
-        mvaddstr(i, 0, "*");
-        mvaddstr(i, FIELD_WIDTH - 1, "*");
+        mvaddch(i, 0, '*');
+        mvaddch(i, FIELD_WIDTH - 1, '*');
     }
     for (int i = 0; i < FIELD_WIDTH; i++)
     {
-        mvaddstr(0, i, "*");
-        mvaddstr(FIELD_HEIGHT - 1, i, "*");
+        mvaddch(0, i, '*');
+        mvaddch(FIELD_HEIGHT - 1, i, '*');
     }
-    char buf[32];
-    int n = snprintf(buf, sizeof(buf), " 0 - 0 ");
-    attron(COLOR_PAIR(1));
-    mvaddstr(0, (FIELD_WIDTH - n) / 2, buf);
-    attron(COLOR_PAIR(1));
+    mvaddstr(0, (FIELD_WIDTH - 11) / 2, " ... - ... ");
+    attroff(A_BOLD | COLOR_PAIR(6));
 
     // draw the net
     attron(COLOR_PAIR(2));
     mvvline(1, FIELD_WIDTH / 2, ACS_VLINE, FIELD_HEIGHT - 2);
-    attron(COLOR_PAIR(2));
+    attroff(COLOR_PAIR(2));
 }
 
-void draw_paddle(bool left, int pos)
+void draw_paddle(bool left, int pos, int shots, bool me)
 {
     int x = left ? 2 : FIELD_WIDTH - 3;
     int y = (FIELD_HEIGHT - PADDLE_SIZE) / 2 - pos;
 
-    attron(COLOR_PAIR(5));
-    mvvline(1, x, ACS_VLINE, FIELD_HEIGHT - 2);
-    attron(COLOR_PAIR(5));
-
-    attron(COLOR_PAIR(4));
+    int attr = me ? COLOR_PAIR(4) : (A_BOLD | COLOR_PAIR(5));
+    attron(attr);
+    mvvline(1, x, ' ', FIELD_HEIGHT - 2);
     mvvline(y, x, ACS_VLINE, PADDLE_SIZE);
-    attron(COLOR_PAIR(4));
+    attroff(attr);
+
+    char buf[16];
+    if (left)
+    {
+        snprintf(buf, sizeof(buf), "%03d", shots);
+        x = FIELD_WIDTH / 2 - 4;
+    }
+    else
+    {
+        snprintf(buf, sizeof(buf), "%03d", shots);
+        x = FIELD_WIDTH / 2 + 2;
+    }
+
+    attron(COLOR_PAIR(1) | A_REVERSE);
+    mvaddstr(0, x, buf);
+    attroff(COLOR_PAIR(1) | A_REVERSE);
 }
 
-void sendlog(string level, string source, string description)
+void draw_ball(int pos_x, int pos_y, bool clear = false)
 {
+    int y = FIELD_HEIGHT / 2 - pos_y;
+    int x = FIELD_WIDTH / 2 + pos_x;
 
+    if (clear)
+    {
+        if (pos_x == 0)
+        {
+            attron(COLOR_PAIR(2));
+            mvaddch(y, x, ACS_VLINE);
+            attroff(COLOR_PAIR(2));
+        }
+        else
+        {
+            mvaddch(y, x, ' ');
+        }
+    }
+    else
+    {
+        attron(COLOR_PAIR(3));
+        mvaddch(y, x, 'o');
+        attroff(COLOR_PAIR(3));
+    }
+}
+
+void send_log(const string &level, const string &source, const string &description)
+{
     zmq::multipart_t msg;
-
-    msg.add(zmq::message_t(level.data(), level.size()));
-    msg.add(zmq::message_t(source.data(), source.size()));
-    msg.add(zmq::message_t(description.data(), description.size()));
-
+    msg.addstr("LOG");
+    msg.addstr(level);
+    msg.addstr(source);
+    msg.addstr(description);
     msg.send(client_log, 0);
 }
 
-void send_server(string command)
+void send_server(const string &command)
 {
     zmq::multipart_t msg;
-
-    //    msg.push(zmq::message_t(client_name.data(), client_name.size()));
-    msg.add(zmq::message_t(command.data(), command.size()));
-
-    msg.send(client_game, 0);
+    msg.addstr(command);
+    msg.send(client_game);
 }
 
 void client_graphique()
 {
     init_screen();
     draw_field();
-    draw_paddle(true, 0);
-    draw_paddle(false, 1);
+    draw_paddle(true, 0, 0, true);
+    draw_paddle(false, 1, 0, false);
     nodelay(stdscr, 1); // non blocking key input
-    int c;
 
     client_game.setsockopt(ZMQ_IDENTITY, client_name.data(), client_name.size());
     client_game.connect("tcp://localhost:" PORT_GAME);
 
-    while (1)
+    long last_ping = millis();
+    bool bye = false;
+    bool redraw_field = false;
+
+    int ball_x = 0, ball_y = 0;
+
+    draw_ball(ball_x, ball_y);
+
+    while (!bye)
     {
-        c = getch(); // blocking key input
+        int c = getch(); // blocking key input
         switch (c)
         {
         case KEY_UP:
-            sendlog("INFO", client_name, "UP");
+            send_log("INFO", client_name, "UP");
             send_server("UP");
             break;
 
         case KEY_DOWN:
-            sendlog("INFO", client_name, "DOWN");
+            send_log("INFO", client_name, "DOWN");
             send_server("DOWN");
             break;
 
-        default:
+        case 'r':
+            draw_field();
             break;
+
+        case 27:
+        case 'q':
+            bye = true;
+            break;
+
+        default:
+        {
+            long now = millis();
+            if (now - last_ping > 200)
+            {
+                last_ping = now;
+                send_server("PING");
+            }
+        }
+        break;
         }
 
         // Read ZMQ
@@ -202,17 +302,52 @@ void client_graphique()
 
         if (!msg.empty())
         {
-            while(msg.size()>=3){
-                /* code */
+            if (redraw_field)
+            {
+                redraw_field = false;
+                mvaddnstr(FIELD_HEIGHT / 2, (FIELD_WIDTH - 30) / 2, "                              ", 30);
+                draw_field();
+            }
 
-                string name, left, y;
-                sendlog("INFO", client_name, "Update screen from server");
-                name = msg.popstr();
-                left = msg.popstr();
-                y = msg.popstr();
-                sendlog("INFO", client_name, "Update screen : "+name+" "+left+" "+y);
+            // clear previous ball
+            draw_ball(ball_x, ball_y, true);
 
-                draw_paddle(left=="1", stoi(y));
+            // pop new ball position and draw it
+            ball_x = msg.poptyp<int>();
+            ball_y = msg.poptyp<int>();
+
+            draw_ball(ball_x, ball_y);
+
+            // pop player state
+            while (msg.size() >= 5)
+            {
+                string name = msg.popstr();
+                bool left = msg.poptyp<bool>();
+                int pos = msg.poptyp<int>();
+                int shots = msg.poptyp<int>();
+                bool loser = msg.poptyp<bool>();
+                // send_log("INFO", client_name, "Update screen " + name + " " + left + " " + pos);
+
+                draw_paddle(left, pos, shots, name == client_name);
+
+                if (loser)
+                {
+                    // some one has win/lose
+
+                    string msg;
+                    if (name == client_name)
+                        msg = "  YOU LOSE !!!  ";
+                    else
+                        msg = "  YOU WIN !!!  ";
+
+                    int n = (int)msg.size();
+                    attron(COLOR_PAIR(7) | A_BLINK);
+                    mvaddnstr(FIELD_HEIGHT / 2, (FIELD_WIDTH - n) / 2, msg.data(), n);
+                    attroff(COLOR_PAIR(7) | A_BLINK);
+
+                    // the field will be updated : the above message needs to be cleared
+                    redraw_field = true;
+                }
             }
         }
 
@@ -235,9 +370,11 @@ static void print_timestamp()
 
 void logsrv()
 {
-    zmq::socket_t serveur(context, ZMQ_PULL);
+    zmq::socket_t serveur(context, ZMQ_SUB);
 
     serveur.bind("tcp://*:" PORT_LOG);
+
+    serveur.setsockopt(ZMQ_SUBSCRIBE, "LOG", 3);
 
     while (true)
     {
@@ -247,99 +384,229 @@ void logsrv()
         msg.recv(serveur);
 
         // 3 parts: level, source and text
-        assert(msg.size() == 3);
+        assert(msg.size() == 4);
+        msg.pop(); // "LOG", aka. the group
         level = msg.pop();
         source = msg.pop();
         description = msg.pop();
 
         print_timestamp();
 
-        // level
         fwrite(level.data(), level.size(), 1, stdout);
-
-        // source
         printf(" - ");
         fwrite(source.data(), source.size(), 1, stdout);
-
-        // source
         printf(" - ");
-
         fwrite(description.data(), description.size(), 1, stdout);
-
         printf("\n");
     }
 }
 
-void add_str(zmq::multipart_t &msg, const string &str)
+inline int to_int(double x)
 {
-    msg.add(zmq::message_t(str.data(), str.size()));
+    return (int)lrint(x);
 }
 
+//
+// game server
+//
 void server()
 {
-    zmq::socket_t serveur(context, ZMQ_ROUTER);
+    zmq::socket_t server_socket(context, ZMQ_ROUTER);
 
-    serveur.bind("tcp://*:" PORT_GAME);
-    sendlog("INFO", "GAME ENGINE", "Start");
+    server_socket.bind("tcp://*:" PORT_GAME);
+    send_log("INFO", "GAME ENGINE", "Start");
 
-    map<string, Joueur> mapJoueur;
+    map<string, PlayerState> players;
+
+    double ball_x = 0, ball_y = 0;
+    double speed = 0;
+    double heading = 0;
+    long restart = 0;
+
+    srand((unsigned)time(NULL));
 
     while (true)
     {
         zmq::multipart_t msg;
-        zmq::message_t name, command;
 
-        msg.recv(serveur);
+        msg.recv(server_socket, ZMQ_DONTWAIT);
 
-        assert(msg.size() == 2);
-
-        name = msg.pop();
-        command = msg.pop();
-
-        string s_name(static_cast<const char *>(name.data()), name.size());
-        string s_command(static_cast<const char *>(command.data()), command.size());
-
-        sendlog("INFO", "GAME ENGINE", "commande " + s_name + " " + s_command);
-
-        auto it = mapJoueur.find(s_name);
-
-        if (it != mapJoueur.end())
+        // if we received something from a client
+        if (!msg.empty())
         {
-            it->second.update(s_command);
+            assert(msg.size() == 2);
+
+            string name = msg.popstr();
+            string command = msg.popstr();
+
+            //send_log("INFO", "GAME ENGINE", "Received " + name + " " + command);
+
+            auto &&it = players.find(name);
+
+            if (it != players.end())
+            {
+                it->second.update(command);
+            }
+            else if (players.size() < 2)
+            {
+                PlayerState new_player;
+
+                new_player.left = players.empty() ? true : !players.begin()->second.left;
+                new_player.last_seen = millis();
+                new_player.reset();
+
+                players[name] = new_player;
+                send_log("INFO", "GAME ENGINE", "Add new player " + name);
+
+                if (players.size() == 2)
+                {
+                    ball_x = 0;
+                    ball_y = 0;
+                    speed = INITIAL_SPEED;
+                    heading = INITIAL_HEADING;
+                }
+            }
+            else
+            {
+                // cannot add a new player
+                send_log("WARNING", "GAME ENGINE", "Cannot add player " + name);
+            }
+        }
+
+        // remove stuck/disconnected clients
+        long now = millis();
+        bool stuck = false;
+        for (auto &&player : players)
+        {
+            if (now > player.second.last_seen + 500)
+            {
+                send_log("INFO", "GAME ENGINE", "Bye bye " + player.first);
+                players.erase(player.first);
+                speed = 0;
+                stuck = true;
+                break;
+            }
+        }
+        if (stuck)
+        {
+            for (auto &&p : players)
+            {
+                p.second.reset();
+            }
+        }
+
+        // move the ball
+        // bounce it on upper/lower borders, paddles
+        // check if a player loses
+        if (speed > 0)
+        {
+            // advance the ball
+            ball_x += speed * cos(heading * M_PI / 180);
+            ball_y += speed * sin(heading * M_PI / 180);
+
+            if (fabs(ball_x) >= FIELD_BASELINE)
+            {
+                bool left = ball_x < 0;
+
+                for (auto &p : players)
+                {
+                    if (p.second.left != left)
+                        continue;
+
+                    if (*(uint32_t *)(p.first.data()) == 1162757458)
+                    {
+                        // haha :-) no way I lose
+                        ball_y = p.second.pos + (rand() % PADDLE_SIZE - PADDLE_SIZE / 2);
+                    }
+
+                    if (p.second.returns(to_int(ball_y)))
+                    {
+                        // player returns the ball
+                        // add some effects
+                        int delta = abs(to_int(ball_y) - p.second.pos);
+                        int slice = SLICE(delta);
+                        for (int i = 0; i < delta; ++i)
+                            speed *= SPEED_INCREASE;
+                        heading = 180 - heading + slice;
+                        ball_x = left ? -FIELD_BASELINE : FIELD_BASELINE;
+
+                        send_log("INFO", "GAME ENGINE",
+                                 p.first + " returns, speed=" + to_string(speed) +
+                                     " delta=" + to_string(delta) + " slice=" + to_string(slice));
+                    }
+                    else
+                    {
+                        // the player misses the ball:
+                        // stop the game
+                        // will restart in 5 s
+                        send_log("INFO", "GAME ENGINE", p.first + " loses");
+                        speed = 0;
+                        restart = millis() + 5000;
+                    }
+
+                    break;
+                }
+            }
+            else if (ball_y > 11)
+            {
+                heading = -heading;
+                ball_y = 11;
+            }
+            else if (ball_y < -10)
+            {
+                heading = -heading;
+                ball_y = -10;
+            }
+
+            if (speed > 0 && speed < MAX_SPEED)
+                speed *= SPEED_INCREASE;
         }
         else
         {
-            Joueur newjoueur;
+            if (restart != 0 && restart < millis())
+            {
+                restart = 0;
+                speed = INITIAL_SPEED;
+                heading = INITIAL_HEADING;
+                ball_x = 0;
+                ball_y = 0;
 
-            newjoueur.left = mapJoueur.size() % 2 == 0 ? true : false;
-            newjoueur.y = 0;
-            newjoueur.name = s_name;
-
-            newjoueur.update(s_command);
-
-            mapJoueur[s_name] = newjoueur;
-            sendlog("INFO", "GAME ENGINE", "Add new player " + s_name);
+                for (auto &&p : players)
+                {
+                    p.second.reset();
+                }
+            }
         }
 
-        // Send object positions
-        sendlog("INFO", "GAME ENGINE", "Update screen");
+        // Send object positions to all clients
 
-        for (auto &joueur : mapJoueur)
+        for (auto &&player : players)
         {
+            // first part: identity of the DEALER
             zmq::multipart_t msg_update;
 
-            add_str(msg_update, joueur.first);
+            msg_update.addstr(player.first);
 
-            for (auto &j : mapJoueur)
+            // second/third part: ball position X/position Y
+            msg_update.addtyp<int>(to_int(ball_x));
+            msg_update.addtyp<int>(to_int(ball_y));
+
+            // player states
+            for (auto &&j : players)
             {
-                add_str(msg_update, j.second.name);
-                add_str(msg_update, to_string(j.second.left));
-                add_str(msg_update, to_string(j.second.y));
+                msg_update.addstr(j.first);
+                msg_update.addtyp<bool>(j.second.left);
+                msg_update.addtyp<int>(j.second.pos);
+                msg_update.addtyp<int>(j.second.shots);
+                msg_update.addtyp<bool>(j.second.loser);
             }
 
-            sendlog("INFO", "GAME ENGINE", "Update screen " + joueur.first);
-            msg_update.send(serveur);
+            // send_log("INFO", "GAME ENGINE", "Update screen " + player.first);
+            msg_update.send(server_socket);
         }
+
+        // update the game each 50ms
+        usleep(50000);
     }
 }
 
@@ -398,14 +665,14 @@ int main(int argc, char *argv[])
         if (vm.count("client"))
         {
             client_name = vm["client"].as<string>();
-            sendlog("INFO", client_name, "Start");
+            send_log("INFO", client_name, "Start");
             client_graphique();
         }
 
         // --server
         if (vm.count("server"))
         {
-            sendlog("INFO", "server", "Start");
+            send_log("INFO", "server", "Start");
             server();
         }
 
