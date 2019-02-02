@@ -56,3 +56,7 @@ zeromq = sockets simplifiées
 * Joueur -> Serveur : PUSH/PULL
 * Autre possibilité : [DEALER/ROUTER](http://api.zeromq.org/4-2:zmq-socket#toc24)
 
+
+## Résultat
+
+![pong](pong.png)
